@@ -70,14 +70,20 @@ if hasattr(os, 'copy_file_range'):
         an opportunity to implement the use of reflinks or server-side
         copy.
         This should work on Linux >= 4.5 only.
+        Return False if the first call fails with an unsupported copy error.
         """
         blocksize = _get_copy_blocksize(source_fd)
         offset = 0
         while True:
-            sent = os.copy_file_range(source_fd, target_fd, blocksize,
-                                      offset_dst=offset)
+            try:
+                sent = os.copy_file_range(source_fd, target_fd, blocksize,
+                                          offset_dst=offset)
+            except OSError as err:
+                if offset == 0 and err.errno in (ETXTBSY, EXDEV):
+                    return False
+                raise
             if sent == 0:
-                break  # EOF
+                return True  # EOF
             offset += sent
 else:
     _copy_file_range = None
@@ -88,13 +94,19 @@ if hasattr(os, 'sendfile'):
         """Copy data from one regular mmap-like fd to another by using
         high-performance sendfile(2) syscall.
         This should work on Linux >= 2.6.33 only.
+        Return False if the first call fails because sockets are required.
         """
         blocksize = _get_copy_blocksize(source_fd)
         offset = 0
         while True:
-            sent = os.sendfile(target_fd, source_fd, offset, blocksize)
+            try:
+                sent = os.sendfile(target_fd, source_fd, offset, blocksize)
+            except OSError as err:
+                if offset == 0 and err.errno == ENOTSOCK:
+                    return False
+                raise
             if sent == 0:
-                break  # EOF
+                return True  # EOF
             offset += sent
 else:
     _sendfile = None
@@ -138,20 +150,10 @@ def copyfileobj(source_f, target_f):
                 except OSError as err:
                     if err.errno not in (EINVAL, ENOTSUP):
                         raise err
-            if _copy_file_range:
-                try:
-                    _copy_file_range(source_fd, target_fd)
-                    return
-                except OSError as err:
-                    if err.errno not in (ETXTBSY, EXDEV):
-                        raise err
-            if _sendfile:
-                try:
-                    _sendfile(source_fd, target_fd)
-                    return
-                except OSError as err:
-                    if err.errno != ENOTSOCK:
-                        raise err
+            if _copy_file_range and _copy_file_range(source_fd, target_fd):
+                return
+            if _sendfile and _sendfile(source_fd, target_fd):
+                return
         except OSError as err:
             # Produce more useful error messages.
             err.filename = source_f.name

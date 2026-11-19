@@ -1550,6 +1550,45 @@ class PathTest(PurePathTest):
         with mock.patch(patchpoint, make_raiser(errno.ENOENT)):
             self.assertRaises(FileNotFoundError, source.copy, target)
 
+    @unittest.skipUnless(hasattr(os, 'copy_file_range') or hasattr(os, 'sendfile'),
+                         'requires a fast copy syscall')
+    def test_move_fails_after_partial_fast_copy(self):
+        # Model short writes with the same file offsets as the real syscalls.
+        def copy_file_range(source_fd, target_fd, count, *, offset_dst):
+            if offset_dst:
+                raise copy_error
+            return os.pwrite(target_fd, os.read(source_fd, 4), offset_dst)
+
+        def sendfile(target_fd, source_fd, offset, count):
+            if offset:
+                raise copy_error
+            return os.write(target_fd, os.pread(source_fd, 4, offset))
+
+        base = self.cls(self.base)
+        original = b'original file contents'
+        for copy, err in ((copy_file_range, errno.EXDEV),
+                          (sendfile, errno.ENOTSOCK)):
+            name = copy.__name__
+            if not hasattr(os, name):
+                continue
+            with self.subTest(syscall=name), contextlib.ExitStack() as ctx:
+                source = base / name
+                target = base / (name + '_moved')
+                source.write_bytes(original)
+                move_error = OSError(errno.EXDEV, 'cross-device move')
+                copy_error = OSError(err, os.strerror(err))
+                ctx.enter_context(mock.patch('os.replace', side_effect=move_error))
+                ctx.enter_context(mock.patch('pathlib._os._ficlone', None))
+                ctx.enter_context(mock.patch('pathlib._os._fcopyfile', None))
+                if name == 'sendfile':
+                    ctx.enter_context(mock.patch('pathlib._os._copy_file_range', None))
+                ctx.enter_context(mock.patch.object(os, name, copy))
+
+                with self.assertRaises(OSError) as raised:
+                    source.move(target)
+                self.assertIs(raised.exception, copy_error)
+                self.assertEqual(source.read_bytes(), original)
+
     @unittest.skipIf(sys.platform == "win32" or sys.platform == "wasi", "directories are always readable on Windows and WASI")
     @requires_non_root_user
     def test_copy_dir_no_read_permission(self):
